@@ -242,17 +242,22 @@ public class WifiAPI {
         Logger.logDebug(LOG_TAG, "Using WifiNetworkSpecifier (Android 10+) for connection");
 
         try {
+            // WEP is not supported by WifiNetworkSpecifier (deprecated security)
+            if (securityType.equalsIgnoreCase("WEP")) {
+                // Fallback to legacy API for WEP
+                Logger.logDebug(LOG_TAG, "WEP not supported by modern API, using legacy method");
+                connectWifiLegacy(out, manager, ssid, password, securityType);
+                return;
+            }
+
             WifiNetworkSpecifier.Builder specBuilder = new WifiNetworkSpecifier.Builder();
             specBuilder.setSsid(ssid);
 
             // Set password based on security type
             if (securityType.equalsIgnoreCase("OPEN")) {
                 // OPEN network, no password
-            } else if (securityType.equalsIgnoreCase("WEP")) {
-                // WEP - use setWepPassphrase
-                specBuilder.setWepPassphrase(password);
             } else {
-                // WPA/WPA2/WPA3 - use setWpa2Passphrase
+                // WPA/WPA2/WPA3 - use setWpa2Passphrase (works for WPA2 and WPA3)
                 specBuilder.setWpa2Passphrase(password);
             }
 
