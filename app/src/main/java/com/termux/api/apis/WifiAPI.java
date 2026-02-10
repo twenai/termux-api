@@ -4,10 +4,16 @@ import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.Intent;
 import android.location.LocationManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.net.wifi.ScanResult;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.net.wifi.WifiNetworkSpecifier;
+import android.os.Build;
 import android.text.TextUtils;
 import android.text.format.Formatter;
 import android.util.JsonWriter;
@@ -17,6 +23,8 @@ import com.termux.api.util.ResultReturner;
 import com.termux.shared.logger.Logger;
 
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class WifiAPI {
 
@@ -151,35 +159,13 @@ public class WifiAPI {
                     String bssid = intent.getStringExtra("bssid");
                     String password = intent.getStringExtra("password");
 
-                    // Validate input
-                    if ((TextUtils.isEmpty(ssid) && TextUtils.isEmpty(bssid)) || TextUtils.isEmpty(password)) {
+                    // Validate SSID or BSSID is provided
+                    if (TextUtils.isEmpty(ssid) && TextUtils.isEmpty(bssid)) {
                         out.name("success").value(false);
-                        out.name("message").value("Missing required parameters: ssid/bssid and password");
+                        out.name("message").value("Missing required parameters: ssid or bssid");
                         out.endObject();
                         return;
                     }
-
-                    // If SSID not provided but BSSID is, try to find the SSID from scan results
-                    if (TextUtils.isEmpty(ssid) && !TextUtils.isEmpty(bssid)) {
-                        List<ScanResult> scans = manager.getScanResults();
-                        if (scans != null) {
-                            for (ScanResult scan : scans) {
-                                if (bssid.equalsIgnoreCase(scan.BSSID)) {
-                                    ssid = scan.SSID;
-                                    break;
-                                }
-                            }
-                        }
-                        if (TextUtils.isEmpty(ssid)) {
-                            out.name("success").value(false);
-                            out.name("message").value("Could not find network with BSSID: " + bssid);
-                            out.endObject();
-                            return;
-                        }
-                    }
-
-                    // Clean up SSID (remove quotes if present)
-                    ssid = ssid.replaceAll("\"", "");
 
                     // Get security type from intent (optional)
                     String securityType = intent.getStringExtra("security_type");
@@ -187,60 +173,54 @@ public class WifiAPI {
                         securityType = "WPA2"; // Default to WPA2
                     }
 
-                    // Create WiFi configuration
-                    WifiConfiguration wifiConfig = new WifiConfiguration();
-                    wifiConfig.SSID = "\"" + ssid + "\""; // SSID must be quoted
-                    wifiConfig.preSharedKey = "\"" + password + "\""; // Password must be quoted
-
-                    // Set security type
-                    if (securityType.equalsIgnoreCase("OPEN")) {
-                        wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE);
-                    } else if (securityType.equalsIgnoreCase("WEP")) {
-                        wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE);
-                        wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.OPEN);
-                        wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.SHARED);
-                        // WEP password handling
-                        if (password.matches("[0-9A-Fa-f]+")) {
-                            wifiConfig.wepKeys[0] = password;
-                        } else {
-                            wifiConfig.wepKeys[0] = "\"" + password + "\"";
-                        }
-                        wifiConfig.wepTxKeyIndex = 0;
-                    } else {
-                        // Default to WPA/WPA2
-                        wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK);
-                        wifiConfig.allowedProtocols.set(WifiConfiguration.Protocol.WPA);
-                        wifiConfig.allowedProtocols.set(WifiConfiguration.Protocol.RSN);
-                        wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.OPEN);
-                        wifiConfig.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.TKIP);
-                        wifiConfig.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.CCMP);
-                        wifiConfig.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.TKIP);
-                        wifiConfig.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.CCMP);
-                    }
-
-                    // Add the network and get its network ID
-                    int networkId = manager.addNetwork(wifiConfig);
-                    if (networkId == -1) {
+                    // Validate password only if not OPEN network
+                    if (!securityType.equalsIgnoreCase("OPEN") && TextUtils.isEmpty(password)) {
                         out.name("success").value(false);
-                        out.name("message").value("Failed to add network configuration");
+                        out.name("message").value("Password required for " + securityType + " network");
                         out.endObject();
                         return;
                     }
 
-                    // Enable the network
-                    manager.disconnect();
-                    boolean success = manager.enableNetwork(networkId, true);
+                    // If SSID not provided but BSSID is, try to find the SSID from scan results
+                    if (TextUtils.isEmpty(ssid) && !TextUtils.isEmpty(bssid)) {
+                        // Check if location is enabled (required for scan results)
+                        if (!isLocationEnabled(context)) {
+                            out.name("success").value(false);
+                            out.name("message").value("Location service needs to be enabled to lookup network by BSSID");
+                            out.endObject();
+                            return;
+                        }
 
-                    if (success) {
-                        // Try to connect
-                        boolean connectSuccess = manager.reconnect();
-                        out.name("success").value(connectSuccess);
-                        out.name("network_id").value(networkId);
-                        out.name("message").value(connectSuccess ? "Connection initiated successfully" : "Network enabled but connection failed");
+                        List<ScanResult> scans = manager.getScanResults();
+                        if (scans != null && !scans.isEmpty()) {
+                            for (ScanResult scan : scans) {
+                                if (bssid.equalsIgnoreCase(scan.BSSID)) {
+                                    ssid = scan.SSID;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (TextUtils.isEmpty(ssid)) {
+                            out.name("success").value(false);
+                            out.name("message").value("Could not find network with BSSID: " + bssid + ". Make sure location is enabled and device scanned the network.");
+                            out.endObject();
+                            return;
+                        }
+                    }
+
+                    // Clean up SSID (remove quotes if present)
+                    if (ssid != null) {
+                        ssid = ssid.replaceAll("\"", "");
+                    }
+
+                    // Use appropriate API based on Android version
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        // Android 10+ : Use WifiNetworkSpecifier
+                        connectWifiAndroid10Plus(context, out, manager, ssid, password, securityType);
                     } else {
-                        out.name("success").value(false);
-                        out.name("network_id").value(networkId);
-                        out.name("message").value("Failed to enable network");
+                        // Android < 10 : Use legacy WifiConfiguration
+                        connectWifiLegacy(out, manager, ssid, password, securityType);
                     }
 
                 } catch (Exception e) {
@@ -252,6 +232,169 @@ public class WifiAPI {
                 out.endObject();
             }
         });
+    }
+
+    /**
+     * Connect WiFi using WifiNetworkSpecifier (Android 10+)
+     */
+    private static void connectWifiAndroid10Plus(Context context, JsonWriter out, WifiManager manager,
+                                                  String ssid, String password, String securityType) throws Exception {
+        Logger.logDebug(LOG_TAG, "Using WifiNetworkSpecifier (Android 10+) for connection");
+
+        try {
+            WifiNetworkSpecifier.Builder specBuilder = new WifiNetworkSpecifier.Builder();
+            specBuilder.setSsid(ssid);
+
+            // Set password based on security type
+            if (securityType.equalsIgnoreCase("OPEN")) {
+                // OPEN network, no password
+            } else if (securityType.equalsIgnoreCase("WEP")) {
+                // WEP - use setWepPassphrase
+                specBuilder.setWepPassphrase(password);
+            } else {
+                // WPA/WPA2/WPA3 - use setWpa2Passphrase
+                specBuilder.setWpa2Passphrase(password);
+            }
+
+            WifiNetworkSpecifier specifier = specBuilder.build();
+
+            NetworkRequest.Builder requestBuilder = new NetworkRequest.Builder();
+            requestBuilder.addTransportType(NetworkCapabilities.TRANSPORT_WIFI);
+            requestBuilder.setNetworkSpecifier(specifier);
+            NetworkRequest request = requestBuilder.build();
+
+            ConnectivityManager connectivityManager =
+                    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+
+            final boolean[] connected = {false};
+            final Exception[] lastException = {null};
+            final CountDownLatch latch = new CountDownLatch(1);
+
+            ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    Logger.logDebug(LOG_TAG, "Network available, connection successful");
+                    connected[0] = true;
+                    latch.countDown();
+                }
+
+                @Override
+                public void onUnavailable() {
+                    Logger.logDebug(LOG_TAG, "Network unavailable, connection failed");
+                    connected[0] = false;
+                    latch.countDown();
+                }
+            };
+
+            Logger.logDebug(LOG_TAG, "Requesting network connection to: " + ssid);
+            connectivityManager.requestNetwork(request, networkCallback, 15000); // 15 second timeout
+
+            // Wait for network callback with timeout
+            boolean completed = latch.await(20, TimeUnit.SECONDS);
+
+            if (connected[0]) {
+                out.name("success").value(true);
+                out.name("message").value("Connected to " + ssid);
+            } else {
+                out.name("success").value(false);
+                String message = completed ? "Connection failed or user rejected" : "Connection request timed out";
+                out.name("message").value(message);
+            }
+
+        } catch (Exception e) {
+            Logger.logStackTraceWithMessage(LOG_TAG, "Error in connectWifiAndroid10Plus", e);
+            out.name("success").value(false);
+            out.name("message").value("Error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Connect WiFi using WifiConfiguration (Android < 10)
+     * Note: This API is deprecated and has limited functionality on modern Android versions.
+     */
+    private static void connectWifiLegacy(JsonWriter out, WifiManager manager, String ssid,
+                                          String password, String securityType) throws Exception {
+        Logger.logDebug(LOG_TAG, "Using WifiConfiguration (legacy) for connection");
+
+        try {
+            // Create WiFi configuration
+            WifiConfiguration wifiConfig = new WifiConfiguration();
+            wifiConfig.SSID = "\"" + ssid + "\""; // SSID must be quoted
+
+            // Set security type and password
+            if (securityType.equalsIgnoreCase("OPEN")) {
+                wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE);
+            } else if (securityType.equalsIgnoreCase("WEP")) {
+                wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE);
+                wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.OPEN);
+                wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.SHARED);
+                // WEP password handling
+                if (password.matches("[0-9A-Fa-f]+")) {
+                    wifiConfig.wepKeys[0] = password;
+                } else {
+                    wifiConfig.wepKeys[0] = "\"" + password + "\"";
+                }
+                wifiConfig.wepTxKeyIndex = 0;
+            } else {
+                // Default to WPA/WPA2
+                wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK);
+                wifiConfig.allowedProtocols.set(WifiConfiguration.Protocol.WPA);
+                wifiConfig.allowedProtocols.set(WifiConfiguration.Protocol.RSN);
+                wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.OPEN);
+                wifiConfig.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.TKIP);
+                wifiConfig.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.CCMP);
+                wifiConfig.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.TKIP);
+                wifiConfig.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.CCMP);
+
+                // Set password for WPA networks
+                wifiConfig.preSharedKey = "\"" + password + "\"";
+            }
+
+            // Try to add network or update existing one
+            int networkId = manager.addNetwork(wifiConfig);
+
+            if (networkId == -1) {
+                // addNetwork failed - might be due to platform restrictions on Android 10+
+                // Try to find and update existing configuration
+                List<WifiConfiguration> configured = manager.getConfiguredNetworks();
+                if (configured != null) {
+                    for (WifiConfiguration config : configured) {
+                        if (config.SSID.equals("\"" + ssid + "\"")) {
+                            networkId = config.networkId;
+                            Logger.logDebug(LOG_TAG, "Found existing network with id: " + networkId);
+                            break;
+                        }
+                    }
+                }
+
+                if (networkId == -1) {
+                    out.name("success").value(false);
+                    out.name("message").value("Failed to add/find network configuration. This may be due to Android version restrictions (Android 10+ requires system app for network management).");
+                    return;
+                }
+            }
+
+            // Enable the network
+            manager.disconnect();
+            boolean enableSuccess = manager.enableNetwork(networkId, true);
+
+            if (enableSuccess) {
+                // Try to connect
+                boolean connectSuccess = manager.reconnect();
+                out.name("success").value(connectSuccess);
+                out.name("network_id").value(networkId);
+                out.name("message").value(connectSuccess ? "Connection initiated successfully" : "Network enabled but connection may have failed");
+            } else {
+                out.name("success").value(false);
+                out.name("network_id").value(networkId);
+                out.name("message").value("Failed to enable network");
+            }
+
+        } catch (Exception e) {
+            Logger.logStackTraceWithMessage(LOG_TAG, "Error in connectWifiLegacy", e);
+            out.name("success").value(false);
+            out.name("message").value("Error: " + e.getMessage());
+        }
     }
 
 }

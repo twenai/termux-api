@@ -102,7 +102,7 @@ public abstract class ResultReturner {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             byte[] buffer = new byte[1024];
             int l;
-            while ((l = inputStream.read(buffer)) > 0) {
+            while ((l = inputStream.read(buffer)) != -1) {
                 baos.write(buffer, 0, l);
             }
             inputString = new String(baos.toByteArray(), StandardCharsets.UTF_8);
