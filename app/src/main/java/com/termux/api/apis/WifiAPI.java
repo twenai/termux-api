@@ -136,4 +136,122 @@ public class WifiAPI {
         });
     }
 
+    public static void onReceiveWifiConnect(TermuxApiReceiver apiReceiver, final Context context, final Intent intent) {
+        Logger.logDebug(LOG_TAG, "onReceiveWifiConnect");
+
+        ResultReturner.returnData(apiReceiver, intent, new ResultReturner.ResultJsonWriter() {
+            @Override
+            public void writeJson(JsonWriter out) throws Exception {
+                WifiManager manager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                out.beginObject();
+
+                try {
+                    // Get SSID or BSSID from intent
+                    String ssid = intent.getStringExtra("ssid");
+                    String bssid = intent.getStringExtra("bssid");
+                    String password = intent.getStringExtra("password");
+
+                    // Validate input
+                    if ((TextUtils.isEmpty(ssid) && TextUtils.isEmpty(bssid)) || TextUtils.isEmpty(password)) {
+                        out.name("success").value(false);
+                        out.name("message").value("Missing required parameters: ssid/bssid and password");
+                        out.endObject();
+                        return;
+                    }
+
+                    // If SSID not provided but BSSID is, try to find the SSID from scan results
+                    if (TextUtils.isEmpty(ssid) && !TextUtils.isEmpty(bssid)) {
+                        List<ScanResult> scans = manager.getScanResults();
+                        if (scans != null) {
+                            for (ScanResult scan : scans) {
+                                if (bssid.equalsIgnoreCase(scan.BSSID)) {
+                                    ssid = scan.SSID;
+                                    break;
+                                }
+                            }
+                        }
+                        if (TextUtils.isEmpty(ssid)) {
+                            out.name("success").value(false);
+                            out.name("message").value("Could not find network with BSSID: " + bssid);
+                            out.endObject();
+                            return;
+                        }
+                    }
+
+                    // Clean up SSID (remove quotes if present)
+                    ssid = ssid.replaceAll("\"", "");
+
+                    // Get security type from intent (optional)
+                    String securityType = intent.getStringExtra("security_type");
+                    if (TextUtils.isEmpty(securityType)) {
+                        securityType = "WPA2"; // Default to WPA2
+                    }
+
+                    // Create WiFi configuration
+                    WifiConfiguration wifiConfig = new WifiConfiguration();
+                    wifiConfig.SSID = "\"" + ssid + "\""; // SSID must be quoted
+                    wifiConfig.preSharedKey = "\"" + password + "\""; // Password must be quoted
+
+                    // Set security type
+                    if (securityType.equalsIgnoreCase("OPEN")) {
+                        wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE);
+                    } else if (securityType.equalsIgnoreCase("WEP")) {
+                        wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE);
+                        wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.OPEN);
+                        wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.SHARED);
+                        // WEP password handling
+                        if (password.matches("[0-9A-Fa-f]+")) {
+                            wifiConfig.wepKeys[0] = password;
+                        } else {
+                            wifiConfig.wepKeys[0] = "\"" + password + "\"";
+                        }
+                        wifiConfig.wepTxKeyIndex = 0;
+                    } else {
+                        // Default to WPA/WPA2
+                        wifiConfig.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK);
+                        wifiConfig.allowedProtocols.set(WifiConfiguration.Protocol.WPA);
+                        wifiConfig.allowedProtocols.set(WifiConfiguration.Protocol.RSN);
+                        wifiConfig.allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.OPEN);
+                        wifiConfig.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.TKIP);
+                        wifiConfig.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.CCMP);
+                        wifiConfig.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.TKIP);
+                        wifiConfig.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.CCMP);
+                    }
+
+                    // Add the network and get its network ID
+                    int networkId = manager.addNetwork(wifiConfig);
+                    if (networkId == -1) {
+                        out.name("success").value(false);
+                        out.name("message").value("Failed to add network configuration");
+                        out.endObject();
+                        return;
+                    }
+
+                    // Enable the network
+                    manager.disconnect();
+                    boolean success = manager.enableNetwork(networkId, true);
+
+                    if (success) {
+                        // Try to connect
+                        boolean connectSuccess = manager.reconnect();
+                        out.name("success").value(connectSuccess);
+                        out.name("network_id").value(networkId);
+                        out.name("message").value(connectSuccess ? "Connection initiated successfully" : "Network enabled but connection failed");
+                    } else {
+                        out.name("success").value(false);
+                        out.name("network_id").value(networkId);
+                        out.name("message").value("Failed to enable network");
+                    }
+
+                } catch (Exception e) {
+                    Logger.logStackTraceWithMessage(LOG_TAG, "Error in onReceiveWifiConnect", e);
+                    out.name("success").value(false);
+                    out.name("message").value("Error: " + e.getMessage());
+                }
+
+                out.endObject();
+            }
+        });
+    }
+
 }
